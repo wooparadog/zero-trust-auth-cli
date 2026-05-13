@@ -27,19 +27,60 @@ From this checkout:
 go build .
 ```
 
-## Usage
+## Login
 
 ```sh
 zero-trust-auth-cli login https://example.com
 . "$(zero-trust-auth-cli config-path)/token.env"
 
 curl -H "$CF_ACCESS_AUTHORIZATION_HEADER" https://example.com
+```
 
+`login` prints the Cloudflare authorization URL, starts a localhost callback server on a random port, exchanges the returned authorization code for tokens, and writes a sourceable shell file.
+
+When the token file is sourced, it checks `CF_ACCESS_TOKEN_EXPIRES_AT_UNIX`. If the access token is expired and `zero-trust-auth-cli` is available in `PATH`, the file automatically runs:
+
+```sh
+zero-trust-auth-cli renew -config "$CF_ACCESS_CONFIG_FILE" -out "$CF_ACCESS_TOKEN_FILE"
+```
+
+After a successful renewal, it reloads the updated token file so the current shell gets the new access token.
+
+## Remote SSH Login
+
+When running from a remote SSH session, copy the printed authorization URL into your local browser. After Cloudflare redirects to the localhost callback URL, the browser may fail to connect because the callback server is on the remote host.
+
+Copy the final URL from your browser address bar:
+
+```text
+http://127.0.0.1:12345/callback?code=...&state=...
+```
+
+Paste that URL into the waiting CLI and press Enter. The localhost server remains active at the same time, so normal non-SSH browser callbacks still work.
+
+## Renew
+
+```sh
 zero-trust-auth-cli renew
 . "$(zero-trust-auth-cli config-path)/token.env"
 ```
 
-When running from a remote SSH session, copy the printed authorization URL into your local browser. After Cloudflare redirects to the localhost callback URL, the browser may fail to connect because the callback server is on the remote host. Copy that final `http://127.0.0.1:.../callback?...` URL from the browser address bar, paste it into the waiting CLI, and press Enter. The local callback server remains active at the same time, so normal non-SSH browser callbacks still work.
+`renew` reads `CF_ACCESS_REFRESH_TOKEN`, `CF_ACCESS_CLIENT_ID`, and `CF_ACCESS_TOKEN_ENDPOINT` from the token file, then rewrites the same file with a new access token. If Cloudflare rotates the refresh token, the new value is saved. If Cloudflare does not return a refresh token during `login`, `renew` cannot work and you will need to check the Access application's Managed OAuth settings.
+
+If automatic renewal fails while sourcing the token file, the shell prints a suggested `zero-trust-auth-cli login ...` command. It does not run login automatically.
+
+## Verbose Diagnostics
+
+Use `-verbose` to print the raw token endpoint response to stderr:
+
+```sh
+zero-trust-auth-cli login -verbose https://example.com
+zero-trust-auth-cli renew -verbose
+```
+
+This output includes access tokens and any refresh token returned by Cloudflare. Treat it as secret and avoid saving it in shell history, CI logs, or issue trackers.
+
+## Config Files
 
 By default, config and token files are stored below Go's `os.UserConfigDir()`:
 
@@ -51,8 +92,27 @@ The token file is written with mode `0600` and contains exports such as:
 ```sh
 export CF_ACCESS_TOKEN='oauth:...'
 export CF_ACCESS_REFRESH_TOKEN='oauth:...'
+export CF_ACCESS_TOKEN_EXPIRES_AT='2026-04-25T01:17:03Z'
+export CF_ACCESS_TOKEN_EXPIRES_AT_UNIX='1777079823'
 export CF_ACCESS_BEARER='Bearer oauth:...'
 export CF_ACCESS_AUTHORIZATION_HEADER='Authorization: Bearer oauth:...'
+export CF_ACCESS_TOKEN_FILE='/home/alice/.config/zero-trust-auth-cli/token.env'
+export CF_ACCESS_CONFIG_FILE='/home/alice/.config/zero-trust-auth-cli/config.json'
+```
+
+## Build
+
+```sh
+make test
+make release
+```
+
+`make release` writes cross-compiled binaries to `dist/`:
+
+```text
+zero-trust-auth-cli-windows-amd64.exe
+zero-trust-auth-cli-darwin-arm64
+zero-trust-auth-cli-linux-amd64
 ```
 
 ## Flags
@@ -61,6 +121,8 @@ export CF_ACCESS_AUTHORIZATION_HEADER='Authorization: Bearer oauth:...'
 zero-trust-auth-cli login [flags] <protected-url>
 zero-trust-auth-cli renew [flags]
 ```
+
+Login flags:
 
 - `-out FILE`: Write the shell token file somewhere else.
 - `-config FILE`: Use a different config file.

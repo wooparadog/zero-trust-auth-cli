@@ -253,7 +253,7 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	shellFile := renderShellEnv(result, time.Now().UTC())
+	shellFile := renderShellEnv(result, time.Now().UTC(), outputPath, configPath)
 	if err := writePrivateFile(outputPath, []byte(shellFile)); err != nil {
 		return err
 	}
@@ -369,7 +369,7 @@ func runRenew(args []string, stdout, stderr io.Writer) error {
 		IssuedAt:            now,
 	}
 
-	shellFile := renderShellEnv(result, now)
+	shellFile := renderShellEnv(result, now, tokenPath, configPath)
 	if err := writePrivateFile(tokenPath, []byte(shellFile)); err != nil {
 		return err
 	}
@@ -1103,10 +1103,13 @@ func parseBearerChallenge(header string) map[string]string {
 	return result
 }
 
-func renderShellEnv(result *loginResult, generatedAt time.Time) string {
+func renderShellEnv(result *loginResult, generatedAt time.Time, tokenFile, configFile string) string {
 	expiresAt := ""
+	expiresAtUnix := ""
 	if result.Token.ExpiresIn > 0 {
-		expiresAt = result.IssuedAt.Add(time.Duration(result.Token.ExpiresIn) * time.Second).Format(time.RFC3339)
+		expiresAtTime := result.IssuedAt.Add(time.Duration(result.Token.ExpiresIn) * time.Second)
+		expiresAt = expiresAtTime.Format(time.RFC3339)
+		expiresAtUnix = strconv.FormatInt(expiresAtTime.Unix(), 10)
 	}
 
 	values := [][2]string{
@@ -1115,10 +1118,13 @@ func renderShellEnv(result *loginResult, generatedAt time.Time) string {
 		{"CF_ACCESS_TOKEN_TYPE", result.Token.TokenType},
 		{"CF_ACCESS_TOKEN_EXPIRES_IN", strconv.FormatInt(result.Token.ExpiresIn, 10)},
 		{"CF_ACCESS_TOKEN_EXPIRES_AT", expiresAt},
+		{"CF_ACCESS_TOKEN_EXPIRES_AT_UNIX", expiresAtUnix},
 		{"CF_ACCESS_RESOURCE", result.Token.Resource},
 		{"CF_ACCESS_CLIENT_ID", result.ClientID},
 		{"CF_ACCESS_AUTHORIZATION_SERVER", result.AuthorizationServer},
 		{"CF_ACCESS_TOKEN_ENDPOINT", result.TokenEndpoint},
+		{"CF_ACCESS_TOKEN_FILE", tokenFile},
+		{"CF_ACCESS_CONFIG_FILE", configFile},
 	}
 
 	var b strings.Builder
@@ -1144,7 +1150,40 @@ func renderShellEnv(result *loginResult, generatedAt time.Time) string {
 		b.WriteString(shellQuote("Authorization: Bearer " + result.Token.AccessToken))
 		b.WriteByte('\n')
 	}
+	writeAutoRenewShell(&b)
 	return b.String()
+}
+
+func writeAutoRenewShell(b *strings.Builder) {
+	b.WriteString(`
+
+cf_access_token_expired() {
+  [ -n "${CF_ACCESS_TOKEN_EXPIRES_AT_UNIX:-}" ] && [ "$(date +%s)" -ge "${CF_ACCESS_TOKEN_EXPIRES_AT_UNIX:-0}" ]
+}
+
+if [ -z "${CF_ACCESS_TOKEN_AUTO_RENEWING:-}" ] && cf_access_token_expired; then
+  if command -v zero-trust-auth-cli >/dev/null 2>&1; then
+    CF_ACCESS_TOKEN_AUTO_RENEWING=1
+    if zero-trust-auth-cli renew -config "$CF_ACCESS_CONFIG_FILE" -out "$CF_ACCESS_TOKEN_FILE" >/dev/null; then
+      if [ -f "$CF_ACCESS_TOKEN_FILE" ]; then
+        . "$CF_ACCESS_TOKEN_FILE"
+      fi
+    else
+      printf '%s\n' 'zero-trust-auth-cli could not renew the Cloudflare Access token.' >&2
+      printf '%s\n' 'The refresh token may be expired. Please run login again; no login command was executed automatically.' >&2
+      if [ -n "${CF_ACCESS_RESOURCE:-}" ]; then
+        printf '%s\n' "Suggested command: zero-trust-auth-cli login ${CF_ACCESS_RESOURCE}" >&2
+      else
+        printf '%s\n' 'Suggested command: zero-trust-auth-cli login <protected-url>' >&2
+      fi
+    fi
+    unset CF_ACCESS_TOKEN_AUTO_RENEWING
+  else
+    printf '%s\n' 'Cloudflare Access token is expired, but zero-trust-auth-cli was not found in PATH.' >&2
+    printf '%s\n' 'Install zero-trust-auth-cli or run zero-trust-auth-cli renew manually.' >&2
+  fi
+fi
+`)
 }
 
 func shellQuote(value string) string {

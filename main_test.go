@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,17 +71,139 @@ func TestRenderShellEnv(t *testing.T) {
 		IssuedAt:            issuedAt,
 	}
 
-	env := renderShellEnv(result, issuedAt)
+	env := renderShellEnv(result, issuedAt, "/tmp/token.env", "/tmp/config.json")
 	for _, want := range []string{
 		"export CF_ACCESS_TOKEN='oauth:access'",
 		"export CF_ACCESS_REFRESH_TOKEN='oauth:refresh'",
 		"export CF_ACCESS_TOKEN_EXPIRES_AT='2026-04-25T01:17:03Z'",
+		"export CF_ACCESS_TOKEN_EXPIRES_AT_UNIX='1777079823'",
+		"export CF_ACCESS_TOKEN_FILE='/tmp/token.env'",
+		"export CF_ACCESS_CONFIG_FILE='/tmp/config.json'",
 		"export CF_ACCESS_BEARER='Bearer oauth:access'",
 		"export CF_ACCESS_AUTHORIZATION_HEADER='Authorization: Bearer oauth:access'",
+		"zero-trust-auth-cli renew -config \"$CF_ACCESS_CONFIG_FILE\" -out \"$CF_ACCESS_TOKEN_FILE\"",
+		"Suggested command: zero-trust-auth-cli login",
 	} {
 		if !strings.Contains(env, want) {
 			t.Fatalf("rendered env missing %q:\n%s", want, env)
 		}
+	}
+}
+
+func TestGeneratedShellEnvAutoRenewsExpiredToken(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token.env")
+	configPath := filepath.Join(dir, "config.json")
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mockCLI := filepath.Join(binDir, "zero-trust-auth-cli")
+	mockScript := `#!/bin/sh
+out=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -out)
+      out="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -z "$out" ]; then
+  exit 2
+fi
+cat > "$out" <<'EOF'
+export CF_ACCESS_TOKEN='access-new'
+export CF_ACCESS_AUTHORIZATION_HEADER='Authorization: Bearer access-new'
+export CF_ACCESS_TOKEN_EXPIRES_AT_UNIX='4102444800'
+EOF
+`
+	if err := os.WriteFile(mockCLI, []byte(mockScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	expired := &loginResult{
+		Token: tokenResponse{
+			AccessToken:  "access-old",
+			RefreshToken: "refresh-old",
+			TokenType:    "bearer",
+			ExpiresIn:    1,
+			Resource:     "https://example.com",
+		},
+		ClientID:            "client-1",
+		Resource:            "https://example.com",
+		AuthorizationServer: "https://team.cloudflareaccess.com",
+		TokenEndpoint:       "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/token",
+		IssuedAt:            time.Unix(1, 0).UTC(),
+	}
+	if err := os.WriteFile(tokenPath, []byte(renderShellEnv(expired, time.Now().UTC(), tokenPath, configPath)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sh", "-c", `. "$1" && [ "$CF_ACCESS_TOKEN" = "access-new" ] && [ "$CF_ACCESS_AUTHORIZATION_HEADER" = "Authorization: Bearer access-new" ]`, "sh", tokenPath)
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("source expired env failed: %v\n%s", err, output)
+	}
+}
+
+func TestGeneratedShellEnvPromptsLoginWhenRenewFails(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token.env")
+	configPath := filepath.Join(dir, "config.json")
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mockCLI := filepath.Join(binDir, "zero-trust-auth-cli")
+	if err := os.WriteFile(mockCLI, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	expired := &loginResult{
+		Token: tokenResponse{
+			AccessToken:  "access-old",
+			RefreshToken: "refresh-old",
+			TokenType:    "bearer",
+			ExpiresIn:    1,
+			Resource:     "https://example.com",
+		},
+		ClientID:            "client-1",
+		Resource:            "https://example.com",
+		AuthorizationServer: "https://team.cloudflareaccess.com",
+		TokenEndpoint:       "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/token",
+		IssuedAt:            time.Unix(1, 0).UTC(),
+	}
+	if err := os.WriteFile(tokenPath, []byte(renderShellEnv(expired, time.Now().UTC(), tokenPath, configPath)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sh", "-c", `. "$1"`, "sh", tokenPath)
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("source expired env with failed renew should not fail shell: %v\n%s", err, output)
+	}
+	text := string(output)
+	if !strings.Contains(text, "The refresh token may be expired") {
+		t.Fatalf("missing refresh-expired prompt:\n%s", text)
+	}
+	if !strings.Contains(text, "Suggested command: zero-trust-auth-cli login https://example.com") {
+		t.Fatalf("missing login suggestion:\n%s", text)
 	}
 }
 
@@ -185,7 +308,7 @@ func TestRunRenewRewritesTokenFile(t *testing.T) {
 		AuthorizationServer: server.URL,
 		TokenEndpoint:       server.URL,
 		IssuedAt:            time.Now().UTC(),
-	}, time.Now().UTC())
+	}, time.Now().UTC(), tokenPath, configPath)
 	if err := os.WriteFile(tokenPath, []byte(initial), 0o600); err != nil {
 		t.Fatal(err)
 	}
