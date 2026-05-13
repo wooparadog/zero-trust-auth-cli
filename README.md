@@ -100,6 +100,18 @@ export CF_ACCESS_TOKEN_FILE='/home/alice/.config/zero-trust-auth-cli/token.env'
 export CF_ACCESS_CONFIG_FILE='/home/alice/.config/zero-trust-auth-cli/config.json'
 ```
 
+To load the token automatically in new shells, add this to `~/.zshrc`, `~/.bashrc`, or your shell's equivalent startup file:
+
+```sh
+[[ -s "$HOME/.config/zero-trust-auth-cli/token.env" ]] && source "$HOME/.config/zero-trust-auth-cli/token.env"
+```
+
+On macOS, replace the path with the location printed by:
+
+```sh
+zero-trust-auth-cli config-path
+```
+
 ## Build
 
 ```sh
