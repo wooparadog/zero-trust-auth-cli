@@ -437,6 +437,92 @@ func TestParseManualCallbackURLRejectsNonLoopback(t *testing.T) {
 	}
 }
 
+func TestSurgeScriptBootstrapRoundtrip(t *testing.T) {
+	scriptPath := t.TempDir() + "/cf-zero-trust.js"
+
+	// First login.
+	entries := readBootstrapFromScript(scriptPath)
+	entries["https://a.example.com"] = surgeBootstrapEntry{
+		Resource: "https://a.example.com", RefreshToken: "rt-1", ClientID: "client-1",
+		TokenEndpoint: "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/token",
+	}
+	body, err := renderSurgeScript(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second login (different origin) — must preserve the first entry.
+	entries = readBootstrapFromScript(scriptPath)
+	if entries["https://a.example.com"].RefreshToken != "rt-1" {
+		t.Fatalf("first-pass entry lost: %+v", entries)
+	}
+	entries["https://b.example.com"] = surgeBootstrapEntry{
+		Resource: "https://b.example.com", RefreshToken: "rt-2", ClientID: "client-2",
+		TokenEndpoint: "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/token",
+	}
+	body, err = renderSurgeScript(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	entries = readBootstrapFromScript(scriptPath)
+	if len(entries) != 2 {
+		t.Fatalf("len(entries) = %d, want 2: %+v", len(entries), entries)
+	}
+	if entries["https://a.example.com"].RefreshToken != "rt-1" {
+		t.Fatalf("a refresh_token = %q, want rt-1", entries["https://a.example.com"].RefreshToken)
+	}
+	if entries["https://b.example.com"].ClientID != "client-2" {
+		t.Fatalf("b client_id = %q, want client-2", entries["https://b.example.com"].ClientID)
+	}
+
+	// Re-login for an existing origin overwrites that entry.
+	entries["https://a.example.com"] = surgeBootstrapEntry{
+		Resource: "https://a.example.com", RefreshToken: "rt-1-new", ClientID: "client-1",
+		TokenEndpoint: "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/token",
+	}
+	body, _ = renderSurgeScript(entries)
+	_ = os.WriteFile(scriptPath, body, 0o600)
+	entries = readBootstrapFromScript(scriptPath)
+	if entries["https://a.example.com"].RefreshToken != "rt-1-new" {
+		t.Fatalf("a refresh_token after re-login = %q, want rt-1-new", entries["https://a.example.com"].RefreshToken)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("len(entries) after re-login = %d, want 2", len(entries))
+	}
+}
+
+func TestRenderSurgeModule(t *testing.T) {
+	entries := map[string]surgeBootstrapEntry{
+		"https://b.example.com": {Resource: "https://b.example.com"},
+		"https://a.example.com": {Resource: "https://a.example.com"},
+	}
+	got := renderSurgeModule(entries, "/Users/me/Library/Application Support/zero-trust-auth-cli/cf-zero-trust.js")
+	for _, want := range []string{
+		"hostname = %APPEND% a.example.com, b.example.com",
+		"pattern=^https?:\\/\\/(a\\.example\\.com|b\\.example\\.com)(\\/.*)?$",
+		"script-path=/Users/me/Library/Application Support/zero-trust-auth-cli/cf-zero-trust.js",
+		"type=http-request",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("module missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderSurgeModuleEmpty(t *testing.T) {
+	got := renderSurgeModule(nil, "/tmp/cf-zero-trust.js")
+	if !strings.Contains(got, "example.com") {
+		t.Fatalf("empty module should fall back to example.com placeholder:\n%s", got)
+	}
+}
+
 func TestAuthorizationURL(t *testing.T) {
 	got, err := authorizationURL("https://team.cloudflareaccess.com/cdn-cgi/access/oauth/authorization", "client", "http://127.0.0.1:1234/callback", "https://example.com", "state", "challenge")
 	if err != nil {

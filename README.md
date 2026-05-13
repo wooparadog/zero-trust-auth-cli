@@ -152,3 +152,34 @@ Renew flags:
 - `-verbose`: Print the raw token endpoint response to stderr. This includes secrets.
 
 Your Cloudflare Access application must have Managed OAuth enabled and dynamic client registration configured for the callback host you use. For the default callback host, enable loopback clients for `127.0.0.1`.
+
+## Surge integration (auto-inject `cf-access-token` header)
+
+[Surge](https://nssurge.com/) integration is **opt-in**. Pass `-surge-dir DIR` to `login` and the CLI
+writes two artifacts into `DIR` (typically the folder Surge loads modules
+from). Without the flag, `login` only writes `token.env` and nothing else
+changes.
+
+```sh
+zero-trust-auth-cli login -surge-dir /path/to/SurgeProfiles https://example.com
+```
+
+- `cf-zero-trust.js` — the http-request script. The bootstrap map
+  (`refresh_token` / `client_id` / `token_endpoint` / `resource` per origin)
+  is **inlined** between `// __CF_ZERO_TRUST_BOOTSTRAP_BEGIN__` /
+  `_END__` markers as `const BOOTSTRAP = {…};`, so the script is
+  self-contained and doesn't depend on `require()` or any companion file.
+- `cf-zero-trust.sgmodule` — a ready-to-load Surge module with absolute
+  `script-path`, a `hostname` list and a regex `pattern` built from every
+  origin you've `login`'d. Re-running `login` for another origin merges it
+  in by parsing the existing inlined BOOTSTRAP.
+
+After `login` finishes, the CLI prints a Surge block with the exact next
+steps: enable `Cloudflare Zero Trust Access Auto Auth` once under
+**Surge → More → Modules**, then reload
+Surge after every subsequent `login`. The script runs
+`grant_type=refresh_token` against the OAuth `token_endpoint` from inside
+Surge and injects `cf-access-token: <access_token>` on matching requests.
+A `$notification.post` fires on first use or when a refresh fails.
+
+See [`surge/README.md`](surge/README.md) for details.
