@@ -1,0 +1,4 @@
+/zero-trust-auth-cli
+/bin/
+/dist/
+*.test
