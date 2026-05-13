@@ -123,6 +123,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	switch args[1] {
 	case "login":
 		return runLogin(args[2:], stdin, stdout, stderr)
+	case "renew":
+		return runRenew(args[2:], stdout, stderr)
 	case "config-path":
 		return runConfigPath(stdout)
 	case "version":
@@ -142,6 +144,7 @@ func printUsage(w io.Writer) {
 
 Usage:
   %[1]s login [flags] <protected-url>
+  %[1]s renew [flags]
   %[1]s config-path
   %[1]s version
 
@@ -152,10 +155,19 @@ Login flags:
   -callback-host HOST    Loopback callback host: 127.0.0.1 or localhost. Defaults to 127.0.0.1.
   -timeout DURATION      Time to wait for browser authorization. Defaults to 5m.
   -no-browser            Print the authorization URL without trying to open a browser.
+  -verbose               Print raw token endpoint responses to stderr. Contains secrets.
+
+Renew flags:
+  -out FILE              Sourceable shell token file to renew. Defaults to config.
+  -config FILE           Config file path. Defaults to the config dir.
+  -resource URL          Protected Cloudflare Access URL for endpoint discovery fallback.
+  -timeout DURATION      Time to wait for token renewal. Defaults to 30s.
+  -verbose               Print raw token endpoint responses to stderr. Contains secrets.
 
 Example:
   %[1]s login https://example.com
   . "$(%[1]s config-path)/token.env"
+  %[1]s renew
 
 Remote SSH:
   Open the printed authorization URL locally. If the browser cannot reach
@@ -187,6 +199,7 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	callbackHost := fs.String("callback-host", "127.0.0.1", "loopback callback host")
 	timeout := fs.Duration("timeout", 5*time.Minute, "time to wait for browser authorization")
 	noBrowser := fs.Bool("no-browser", false, "print auth URL without opening browser")
+	verbose := fs.Bool("verbose", false, "print raw token endpoint responses to stderr")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -235,7 +248,7 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	defer cancel()
 
 	httpClient := &http.Client{Timeout: 30 * time.Second}
-	result, err := login(ctx, httpClient, resourceURL, *callbackHost, !*noBrowser, stdin, stderr)
+	result, err := login(ctx, httpClient, resourceURL, *callbackHost, !*noBrowser, stdin, stderr, *verbose)
 	if err != nil {
 		return err
 	}
@@ -258,7 +271,123 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func login(ctx context.Context, client *http.Client, resourceURL *url.URL, callbackHost string, openBrowser bool, stdin io.Reader, logw io.Writer) (*loginResult, error) {
+func runRenew(args []string, stdout, stderr io.Writer) error {
+	paths, err := defaultPaths()
+	if err != nil {
+		return err
+	}
+
+	fs := flag.NewFlagSet("renew", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	outFlag := fs.String("out", "", "sourceable shell token file to renew")
+	configFlag := fs.String("config", paths.ConfigFile, "config file path")
+	resourceFlag := fs.String("resource", "", "protected Cloudflare Access URL for endpoint discovery fallback")
+	timeout := fs.Duration("timeout", 30*time.Second, "time to wait for token renewal")
+	verbose := fs.Bool("verbose", false, "print raw token endpoint responses to stderr")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("renew does not accept positional arguments")
+	}
+
+	configPath, err := expandPath(*configFlag)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	tokenPath := strings.TrimSpace(*outFlag)
+	if tokenPath == "" {
+		tokenPath = strings.TrimSpace(cfg.TokenFile)
+	}
+	if tokenPath == "" {
+		tokenPath = paths.TokenFile
+	}
+	tokenPath, err = expandPath(tokenPath)
+	if err != nil {
+		return err
+	}
+
+	env, err := loadShellEnvFile(tokenPath)
+	if err != nil {
+		return err
+	}
+
+	refreshToken := strings.TrimSpace(env["CF_ACCESS_REFRESH_TOKEN"])
+	if refreshToken == "" {
+		return fmt.Errorf("%s does not include CF_ACCESS_REFRESH_TOKEN; run login again", tokenPath)
+	}
+	clientID := strings.TrimSpace(env["CF_ACCESS_CLIENT_ID"])
+	if clientID == "" {
+		return fmt.Errorf("%s does not include CF_ACCESS_CLIENT_ID; run login again", tokenPath)
+	}
+
+	resource := firstNonEmpty(*resourceFlag, env["CF_ACCESS_RESOURCE"], cfg.Resource)
+	authServer := firstNonEmpty(env["CF_ACCESS_AUTHORIZATION_SERVER"], cfg.AuthorizationServer)
+	tokenEndpoint := strings.TrimSpace(env["CF_ACCESS_TOKEN_ENDPOINT"])
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	if tokenEndpoint == "" {
+		tokenEndpoint, authServer, err = discoverTokenEndpointForRenew(ctx, httpClient, resource, authServer)
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Fprintln(stderr, "Renewing access token with saved refresh token")
+	token, err := renewAccessToken(ctx, httpClient, tokenEndpoint, clientID, refreshToken, verboseWriter(stderr, *verbose))
+	if err != nil {
+		return err
+	}
+	if token.AccessToken == "" {
+		return errors.New("token endpoint response did not include access_token")
+	}
+	if token.RefreshToken == "" {
+		token.RefreshToken = refreshToken
+	}
+	if token.TokenType == "" {
+		token.TokenType = firstNonEmpty(env["CF_ACCESS_TOKEN_TYPE"], "bearer")
+	}
+	if token.Resource == "" {
+		token.Resource = resource
+	}
+
+	now := time.Now().UTC()
+	result := &loginResult{
+		Token:               token,
+		ClientID:            clientID,
+		Resource:            token.Resource,
+		AuthorizationServer: authServer,
+		TokenEndpoint:       tokenEndpoint,
+		IssuedAt:            now,
+	}
+
+	shellFile := renderShellEnv(result, now)
+	if err := writePrivateFile(tokenPath, []byte(shellFile)); err != nil {
+		return err
+	}
+
+	cfg.Resource = firstNonEmpty(result.Resource, cfg.Resource)
+	cfg.TokenFile = tokenPath
+	cfg.AuthorizationServer = firstNonEmpty(result.AuthorizationServer, cfg.AuthorizationServer)
+	cfg.UpdatedAt = now.Format(time.RFC3339)
+	if err := saveConfig(configPath, cfg); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Renewed sourceable token file: %s\n", tokenPath)
+	fmt.Fprintf(stdout, "Reload it with: . %s\n", shellQuote(tokenPath))
+	return nil
+}
+
+func login(ctx context.Context, client *http.Client, resourceURL *url.URL, callbackHost string, openBrowser bool, stdin io.Reader, logw io.Writer, verbose bool) (*loginResult, error) {
 	if !isLoopbackHost(callbackHost) {
 		return nil, fmt.Errorf("callback host must be localhost or a loopback address, got %q", callbackHost)
 	}
@@ -312,12 +441,15 @@ func login(ctx context.Context, client *http.Client, resourceURL *url.URL, callb
 	}
 
 	fmt.Fprintln(logw, "Authorization code received; exchanging it for a token")
-	token, err := exchangeCode(ctx, client, discovered.OAuth.TokenEndpoint, clientReg.ClientID, cb.RedirectURI, cbResult.Code, codeVerifier)
+	token, err := exchangeCode(ctx, client, discovered.OAuth.TokenEndpoint, clientReg.ClientID, cb.RedirectURI, cbResult.Code, codeVerifier, verboseWriter(logw, verbose))
 	if err != nil {
 		return nil, err
 	}
 	if token.AccessToken == "" {
 		return nil, errors.New("token endpoint response did not include access_token")
+	}
+	if token.RefreshToken == "" {
+		return nil, errors.New("token endpoint response did not include refresh_token; ensure Cloudflare Managed OAuth has a nonzero grant session duration and supports refresh_token grants")
 	}
 	if token.Resource == "" {
 		token.Resource = discovered.Resource
@@ -465,6 +597,9 @@ func validateOAuthMetadata(metadata *oauthMetadata) error {
 	if len(metadata.GrantTypesSupported) > 0 && !contains(metadata.GrantTypesSupported, "authorization_code") {
 		return errors.New("OAuth server does not advertise authorization_code grant support")
 	}
+	if len(metadata.GrantTypesSupported) > 0 && !contains(metadata.GrantTypesSupported, "refresh_token") {
+		return errors.New("OAuth server does not advertise refresh_token grant support")
+	}
 	if len(metadata.CodeChallengeMethodsSupported) > 0 && !contains(metadata.CodeChallengeMethodsSupported, "S256") {
 		return errors.New("OAuth server does not advertise S256 PKCE support")
 	}
@@ -478,7 +613,7 @@ func registerClient(ctx context.Context, client *http.Client, endpoint, redirect
 	body := map[string]any{
 		"redirect_uris":              []string{redirectURI},
 		"token_endpoint_auth_method": "none",
-		"grant_types":                []string{"authorization_code"},
+		"grant_types":                []string{"authorization_code", "refresh_token"},
 		"response_types":             []string{"code"},
 		"client_name":                appName,
 		"resource":                   resource,
@@ -517,7 +652,7 @@ func registerClient(ctx context.Context, client *http.Client, endpoint, redirect
 	return &result, nil
 }
 
-func exchangeCode(ctx context.Context, client *http.Client, endpoint, clientID, redirectURI, code, codeVerifier string) (tokenResponse, error) {
+func exchangeCode(ctx context.Context, client *http.Client, endpoint, clientID, redirectURI, code, codeVerifier string, debugw io.Writer) (tokenResponse, error) {
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
@@ -539,16 +674,97 @@ func exchangeCode(ctx context.Context, client *http.Client, endpoint, clientID, 
 	}
 	defer resp.Body.Close()
 
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return tokenResponse{}, err
+	}
+	printRawTokenResponse(debugw, "authorization_code", resp.StatusCode, data)
+
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return tokenResponse{}, fmt.Errorf("token exchange failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
 	var token tokenResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&token); err != nil {
+	if err := json.Unmarshal(data, &token); err != nil {
 		return tokenResponse{}, err
 	}
 	return token, nil
+}
+
+func renewAccessToken(ctx context.Context, client *http.Client, endpoint, clientID, refreshToken string, debugw io.Writer) (tokenResponse, error) {
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	form.Set("client_id", clientID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return tokenResponse{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", userAgent())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return tokenResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return tokenResponse{}, err
+	}
+	printRawTokenResponse(debugw, "refresh_token", resp.StatusCode, data)
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return tokenResponse{}, fmt.Errorf("token renewal failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+
+	var token tokenResponse
+	if err := json.Unmarshal(data, &token); err != nil {
+		return tokenResponse{}, err
+	}
+	return token, nil
+}
+
+func verboseWriter(w io.Writer, enabled bool) io.Writer {
+	if !enabled {
+		return nil
+	}
+	return w
+}
+
+func printRawTokenResponse(w io.Writer, grantType string, statusCode int, body []byte) {
+	if w == nil {
+		return
+	}
+	fmt.Fprintf(w, "\nRaw token endpoint response for grant_type=%s (HTTP %d):\n%s\n\n", grantType, statusCode, strings.TrimSpace(string(body)))
+}
+
+func discoverTokenEndpointForRenew(ctx context.Context, client *http.Client, resource, authServer string) (tokenEndpoint string, resolvedAuthServer string, err error) {
+	if strings.TrimSpace(authServer) != "" {
+		metadata, err := fetchOAuthMetadata(ctx, client, authServer)
+		if err != nil {
+			return "", "", err
+		}
+		if metadata.TokenEndpoint == "" {
+			return "", "", errors.New("OAuth metadata did not include token_endpoint")
+		}
+		return metadata.TokenEndpoint, strings.TrimRight(authServer, "/"), nil
+	}
+	if strings.TrimSpace(resource) == "" {
+		return "", "", errors.New("token file does not include CF_ACCESS_TOKEN_ENDPOINT and config has no authorization server or resource for discovery; run login again")
+	}
+	resourceURL, err := normalizeResourceURL(resource)
+	if err != nil {
+		return "", "", err
+	}
+	discovered, err := discover(ctx, client, resourceURL)
+	if err != nil {
+		return "", "", err
+	}
+	return discovered.OAuth.TokenEndpoint, discovered.AuthorizationServer, nil
 }
 
 func startCallbackServer(callbackHost string) (*callbackServer, error) {
@@ -935,6 +1151,114 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
+func loadShellEnvFile(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	env, err := parseShellEnv(data)
+	if err != nil {
+		return nil, fmt.Errorf("read shell env %s: %w", path, err)
+	}
+	return env, nil
+}
+
+func parseShellEnv(data []byte) (map[string]string, error) {
+	env := map[string]string{}
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		if !isShellIdentifier(key) {
+			return nil, fmt.Errorf("line %d has invalid shell variable name %q", lineNumber, key)
+		}
+		value, err := parseShellValue(line[eq+1:])
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", lineNumber, err)
+		}
+		env[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+func parseShellValue(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	var b strings.Builder
+	for i := 0; i < len(raw); {
+		switch raw[i] {
+		case '\'':
+			i++
+			for i < len(raw) && raw[i] != '\'' {
+				b.WriteByte(raw[i])
+				i++
+			}
+			if i >= len(raw) {
+				return "", errors.New("unterminated single-quoted value")
+			}
+			i++
+		case '"':
+			i++
+			for i < len(raw) && raw[i] != '"' {
+				if raw[i] == '\\' && i+1 < len(raw) {
+					i++
+				}
+				b.WriteByte(raw[i])
+				i++
+			}
+			if i >= len(raw) {
+				return "", errors.New("unterminated double-quoted value")
+			}
+			i++
+		case '\\':
+			if i+1 < len(raw) {
+				b.WriteByte(raw[i+1])
+				i += 2
+			} else {
+				i++
+			}
+		case '#':
+			if b.Len() == 0 || i == 0 || raw[i-1] == ' ' || raw[i-1] == '\t' {
+				return strings.TrimSpace(b.String()), nil
+			}
+			b.WriteByte(raw[i])
+			i++
+		default:
+			b.WriteByte(raw[i])
+			i++
+		}
+	}
+	return b.String(), nil
+}
+
+func isShellIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if i == 0 && !(ch == '_' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z') {
+			return false
+		}
+		if !(ch == '_' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
 func loadConfig(path string) (*config, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1095,6 +1419,15 @@ func contains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func isAlphaNum(ch byte) bool {

@@ -13,6 +13,8 @@ The command:
 7. Exchanges the callback code for an access token.
 8. Writes shell exports to a private token file.
 
+The `renew` command uses the saved refresh token to fetch a new access token without opening a browser. Cloudflare controls the maximum token lifetimes in the Access application's Managed OAuth settings; once the refresh-token grant session expires, run `login` again.
+
 ## Install
 
 ```sh
@@ -32,6 +34,9 @@ zero-trust-auth-cli login https://example.com
 . "$(zero-trust-auth-cli config-path)/token.env"
 
 curl -H "$CF_ACCESS_AUTHORIZATION_HEADER" https://example.com
+
+zero-trust-auth-cli renew
+. "$(zero-trust-auth-cli config-path)/token.env"
 ```
 
 When running from a remote SSH session, copy the printed authorization URL into your local browser. After Cloudflare redirects to the localhost callback URL, the browser may fail to connect because the callback server is on the remote host. Copy that final `http://127.0.0.1:.../callback?...` URL from the browser address bar, paste it into the waiting CLI, and press Enter. The local callback server remains active at the same time, so normal non-SSH browser callbacks still work.
@@ -54,6 +59,7 @@ export CF_ACCESS_AUTHORIZATION_HEADER='Authorization: Bearer oauth:...'
 
 ```sh
 zero-trust-auth-cli login [flags] <protected-url>
+zero-trust-auth-cli renew [flags]
 ```
 
 - `-out FILE`: Write the shell token file somewhere else.
@@ -61,5 +67,14 @@ zero-trust-auth-cli login [flags] <protected-url>
 - `-callback-host HOST`: Use `127.0.0.1` or `localhost` for the callback. The default is `127.0.0.1`.
 - `-timeout DURATION`: Browser authorization timeout. The default is `5m`.
 - `-no-browser`: Print the authorization URL without trying to launch a browser.
+- `-verbose`: Print the raw token endpoint response to stderr. This includes secrets.
+
+Renew flags:
+
+- `-out FILE`: Renew a specific shell token file. Defaults to the configured token file.
+- `-config FILE`: Use a different config file.
+- `-resource URL`: Protected Cloudflare Access URL used only if endpoint discovery is needed.
+- `-timeout DURATION`: Token renewal timeout. The default is `30s`.
+- `-verbose`: Print the raw token endpoint response to stderr. This includes secrets.
 
 Your Cloudflare Access application must have Managed OAuth enabled and dynamic client registration configured for the callback host you use. For the default callback host, enable loopback clients for `127.0.0.1`.

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +29,27 @@ func TestParseBearerChallenge(t *testing.T) {
 func TestShellQuote(t *testing.T) {
 	if got, want := shellQuote("can't"), `'can'\''t'`; got != want {
 		t.Fatalf("shellQuote = %q, want %q", got, want)
+	}
+}
+
+func TestParseShellEnv(t *testing.T) {
+	env, err := parseShellEnv([]byte(`
+# comment
+export CF_ACCESS_TOKEN='oauth:access'
+export CF_ACCESS_REFRESH_TOKEN='can'\''t'
+CF_ACCESS_CLIENT_ID=client-1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := env["CF_ACCESS_TOKEN"], "oauth:access"; got != want {
+		t.Fatalf("CF_ACCESS_TOKEN = %q, want %q", got, want)
+	}
+	if got, want := env["CF_ACCESS_REFRESH_TOKEN"], "can't"; got != want {
+		t.Fatalf("CF_ACCESS_REFRESH_TOKEN = %q, want %q", got, want)
+	}
+	if got, want := env["CF_ACCESS_CLIENT_ID"], "client-1"; got != want {
+		t.Fatalf("CF_ACCESS_CLIENT_ID = %q, want %q", got, want)
 	}
 }
 
@@ -61,6 +84,139 @@ func TestRenderShellEnv(t *testing.T) {
 	}
 }
 
+func TestRegisterClientRequestsRefreshTokenGrant(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			GrantTypes []string `json:"grant_types"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if !contains(body.GrantTypes, "authorization_code") {
+			t.Fatalf("grant_types = %v, missing authorization_code", body.GrantTypes)
+		}
+		if !contains(body.GrantTypes, "refresh_token") {
+			t.Fatalf("grant_types = %v, missing refresh_token", body.GrantTypes)
+		}
+		_ = json.NewEncoder(w).Encode(registrationResponse{ClientID: "client-1"})
+	}))
+	defer server.Close()
+
+	client, err := registerClient(context.Background(), server.Client(), server.URL, "http://127.0.0.1:1234/callback", "https://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.ClientID != "client-1" {
+		t.Fatalf("client id = %q, want client-1", client.ClientID)
+	}
+}
+
+func TestRenewAccessToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if got, want := r.Header.Get("Content-Type"), "application/x-www-form-urlencoded"; got != want {
+			t.Fatalf("content-type = %q, want %q", got, want)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		assertQuery(t, r.Form, "grant_type", "refresh_token")
+		assertQuery(t, r.Form, "refresh_token", "refresh-old")
+		assertQuery(t, r.Form, "client_id", "client-1")
+
+		_ = json.NewEncoder(w).Encode(tokenResponse{
+			AccessToken:  "access-new",
+			RefreshToken: "refresh-new",
+			TokenType:    "bearer",
+			ExpiresIn:    1800,
+			Resource:     "https://example.com",
+		})
+	}))
+	defer server.Close()
+
+	var debug strings.Builder
+	token, err := renewAccessToken(context.Background(), server.Client(), server.URL, "client-1", "refresh-old", &debug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.AccessToken != "access-new" {
+		t.Fatalf("access token = %q, want access-new", token.AccessToken)
+	}
+	if token.RefreshToken != "refresh-new" {
+		t.Fatalf("refresh token = %q, want refresh-new", token.RefreshToken)
+	}
+	if !strings.Contains(debug.String(), `"refresh_token":"refresh-new"`) {
+		t.Fatalf("debug output did not include raw token response:\n%s", debug.String())
+	}
+}
+
+func TestRunRenewRewritesTokenFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		assertQuery(t, r.Form, "grant_type", "refresh_token")
+		assertQuery(t, r.Form, "refresh_token", "refresh-old")
+		assertQuery(t, r.Form, "client_id", "client-1")
+		_ = json.NewEncoder(w).Encode(tokenResponse{
+			AccessToken: "access-new",
+			TokenType:   "bearer",
+			ExpiresIn:   900,
+			Resource:    "https://example.com",
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	tokenPath := filepath.Join(dir, "token.env")
+	initial := renderShellEnv(&loginResult{
+		Token: tokenResponse{
+			AccessToken:  "access-old",
+			RefreshToken: "refresh-old",
+			TokenType:    "bearer",
+			ExpiresIn:    60,
+			Resource:     "https://example.com",
+		},
+		ClientID:            "client-1",
+		Resource:            "https://example.com",
+		AuthorizationServer: server.URL,
+		TokenEndpoint:       server.URL,
+		IssuedAt:            time.Now().UTC(),
+	}, time.Now().UTC())
+	if err := os.WriteFile(tokenPath, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(configPath, &config{
+		Resource:            "https://example.com",
+		TokenFile:           tokenPath,
+		AuthorizationServer: server.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if err := runRenew([]string{"-config", configPath}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	env, err := loadShellEnvFile(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := env["CF_ACCESS_TOKEN"], "access-new"; got != want {
+		t.Fatalf("CF_ACCESS_TOKEN = %q, want %q", got, want)
+	}
+	if got, want := env["CF_ACCESS_REFRESH_TOKEN"], "refresh-old"; got != want {
+		t.Fatalf("CF_ACCESS_REFRESH_TOKEN = %q, want preserved %q", got, want)
+	}
+	if got, want := env["CF_ACCESS_AUTHORIZATION_HEADER"], "Authorization: Bearer access-new"; got != want {
+		t.Fatalf("CF_ACCESS_AUTHORIZATION_HEADER = %q, want %q", got, want)
+	}
+}
+
 func TestDiscoverFromWWWAuthenticate(t *testing.T) {
 	var base string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +235,7 @@ func TestDiscoverFromWWWAuthenticate(t *testing.T) {
 				AuthorizationEndpoint:             base + "/authorize",
 				TokenEndpoint:                     base + "/token",
 				RegistrationEndpoint:              base + "/register",
-				GrantTypesSupported:               []string{"authorization_code"},
+				GrantTypesSupported:               []string{"authorization_code", "refresh_token"},
 				TokenEndpointAuthMethodsSupported: []string{"none"},
 				CodeChallengeMethodsSupported:     []string{"S256"},
 			})
