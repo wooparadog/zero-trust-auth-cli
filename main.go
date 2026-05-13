@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,11 +19,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+//go:embed surge/cf-zero-trust.template.js
+var embeddedSurgeScriptTemplate []byte
 
 const appName = "zero-trust-auth-cli"
 
@@ -152,6 +158,9 @@ Login flags:
   -resource URL          Protected Cloudflare Access URL. Overrides config.
   -out FILE              Sourceable shell output file. Defaults to the config dir.
   -config FILE           Config file path. Defaults to the config dir.
+  -surge-dir DIR         If set, also write cf-zero-trust.js and cf-zero-trust.sgmodule
+                         into DIR (typically the folder Surge loads modules from).
+                         Omit to skip Surge artifact generation.
   -callback-host HOST    Loopback callback host: 127.0.0.1 or localhost. Defaults to 127.0.0.1.
   -timeout DURATION      Time to wait for browser authorization. Defaults to 5m.
   -no-browser            Print the authorization URL without trying to open a browser.
@@ -196,6 +205,7 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	resourceFlag := fs.String("resource", "", "protected Cloudflare Access URL")
 	outFlag := fs.String("out", "", "sourceable shell output file")
 	configFlag := fs.String("config", paths.ConfigFile, "config file path")
+	surgeDirFlag := fs.String("surge-dir", "", "if set, also write cf-zero-trust.js and cf-zero-trust.sgmodule into this directory (e.g. /path/to/SurgeProfiles). Omit to skip Surge artifact generation.")
 	callbackHost := fs.String("callback-host", "127.0.0.1", "loopback callback host")
 	timeout := fs.Duration("timeout", 5*time.Minute, "time to wait for browser authorization")
 	noBrowser := fs.Bool("no-browser", false, "print auth URL without opening browser")
@@ -258,6 +268,11 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	scriptPath, modulePath, err := writeSurgeArtifacts(*surgeDirFlag, result)
+	if err != nil {
+		return err
+	}
+
 	cfg.Resource = result.Resource
 	cfg.TokenFile = outputPath
 	cfg.AuthorizationServer = result.AuthorizationServer
@@ -268,6 +283,7 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 
 	fmt.Fprintf(stdout, "Wrote sourceable token file: %s\n", outputPath)
 	fmt.Fprintf(stdout, "Load it with: . %s\n", shellQuote(outputPath))
+	printSurgeBlock(stdout, scriptPath, modulePath)
 	return nil
 }
 
@@ -385,6 +401,164 @@ func runRenew(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "Renewed sourceable token file: %s\n", tokenPath)
 	fmt.Fprintf(stdout, "Reload it with: . %s\n", shellQuote(tokenPath))
 	return nil
+}
+
+// writeSurgeArtifacts merges the result into the BOOTSTRAP map inlined in
+// cf-zero-trust.js, regenerates the script and sgmodule, and returns the
+// absolute paths. If surgeDir is empty, this is a no-op.
+func writeSurgeArtifacts(surgeDir string, result *loginResult) (scriptPath, modulePath string, err error) {
+	surgeDir = strings.TrimSpace(surgeDir)
+	if surgeDir == "" {
+		return "", "", nil
+	}
+	surgeDir, err = expandPath(surgeDir)
+	if err != nil {
+		return "", "", err
+	}
+	scriptPath = filepath.Join(surgeDir, "cf-zero-trust.js")
+	entries := readBootstrapFromScript(scriptPath)
+	entries[surgeBootstrapKey(result.Resource)] = surgeBootstrapEntry{
+		Resource:      result.Resource,
+		RefreshToken:  result.Token.RefreshToken,
+		ClientID:      result.ClientID,
+		TokenEndpoint: result.TokenEndpoint,
+	}
+	scriptBody, err := renderSurgeScript(entries)
+	if err != nil {
+		return "", "", fmt.Errorf("render surge script: %w", err)
+	}
+	if err := writePrivateFile(scriptPath, scriptBody); err != nil {
+		return "", "", fmt.Errorf("write surge script %s: %w", scriptPath, err)
+	}
+	modulePath = filepath.Join(surgeDir, "cf-zero-trust.sgmodule")
+	moduleBody := renderSurgeModule(entries, scriptPath)
+	if err := writePrivateFile(modulePath, []byte(moduleBody)); err != nil {
+		return "", "", fmt.Errorf("write surge module %s: %w", modulePath, err)
+	}
+	return scriptPath, modulePath, nil
+}
+
+func printSurgeBlock(stdout io.Writer, scriptPath, modulePath string) {
+	if scriptPath == "" {
+		return
+	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "────────────────────────────── Surge ──────────────────────────────")
+	fmt.Fprintf(stdout, "  script:    %s\n", scriptPath)
+	fmt.Fprintf(stdout, "  sgmodule:  %s\n", modulePath)
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "  Next steps:")
+	fmt.Fprintln(stdout, "    1. First time only — Surge → More → Modules → enable `Cloudflare Zero Trust Access Auto Auth`.")
+	fmt.Fprintln(stdout, "    2. After every login — reload Surge so the updated BOOTSTRAP")
+	fmt.Fprintln(stdout, "       takes effect (Surge menu bar → Reload, or restart Surge).")
+	fmt.Fprintln(stdout, "────────────────────────────────────────────────────────────────────")
+}
+
+type surgeBootstrapEntry struct {
+	Resource      string `json:"resource"`
+	RefreshToken  string `json:"refresh_token"`
+	ClientID      string `json:"client_id"`
+	TokenEndpoint string `json:"token_endpoint"`
+}
+
+const (
+	bootstrapBeginMarker = "// __CF_ZERO_TRUST_BOOTSTRAP_BEGIN__"
+	bootstrapEndMarker   = "// __CF_ZERO_TRUST_BOOTSTRAP_END__"
+)
+
+func readBootstrapFromScript(path string) map[string]surgeBootstrapEntry {
+	out := map[string]surgeBootstrapEntry{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	s := string(data)
+	i := strings.Index(s, bootstrapBeginMarker)
+	j := strings.Index(s, bootstrapEndMarker)
+	if i < 0 || j <= i {
+		return out
+	}
+	block := s[i+len(bootstrapBeginMarker) : j]
+	a := strings.Index(block, "{")
+	b := strings.LastIndex(block, "}")
+	if a < 0 || b <= a {
+		return out
+	}
+	_ = json.Unmarshal([]byte(block[a:b+1]), &out)
+	if out == nil {
+		out = map[string]surgeBootstrapEntry{}
+	}
+	return out
+}
+
+func surgeBootstrapKey(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return strings.TrimRight(strings.TrimSpace(raw), "/")
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+}
+
+func renderSurgeScript(entries map[string]surgeBootstrapEntry) ([]byte, error) {
+	if entries == nil {
+		entries = map[string]surgeBootstrapEntry{}
+	}
+	body, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	rendered := strings.Replace(string(embeddedSurgeScriptTemplate), "__CF_ZERO_TRUST_BOOTSTRAP__", string(body), 1)
+	return []byte(rendered), nil
+}
+
+func renderSurgeModule(entries map[string]surgeBootstrapEntry, scriptPath string) string {
+	var hosts []string
+	for origin := range entries {
+		u, err := url.Parse(origin)
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		hosts = append(hosts, u.Hostname())
+	}
+	sort.Strings(hosts)
+	hosts = dedupe(hosts)
+
+	hostnameList := "example.com"
+	var pattern string
+	if len(hosts) > 0 {
+		hostnameList = strings.Join(hosts, ", ")
+		escaped := make([]string, len(hosts))
+		for i, h := range hosts {
+			escaped[i] = regexp.QuoteMeta(h)
+		}
+		pattern = "^https?:\\/\\/(" + strings.Join(escaped, "|") + ")(\\/.*)?$"
+	} else {
+		pattern = "^https?:\\/\\/example\\.com(\\/.*)?$"
+	}
+
+	return fmt.Sprintf(`#!name=Cloudflare Zero Trust Access Auto Auth
+#!desc=Auto-generated by zero-trust-auth-cli. Injects cf-access-token header for Cloudflare Access protected hosts, and invalidates the cached token when upstream replies 401. Re-run `+"`zero-trust-auth-cli login <url>`"+` to update.
+
+[MITM]
+hostname = %%APPEND%% %s
+
+[Script]
+cf-zero-trust-auth = type=http-request,pattern=%s,requires-body=0,max-size=0,timeout=5,script-path=%s
+cf-zero-trust-invalidate = type=http-response,pattern=%s,requires-body=0,max-size=0,timeout=5,script-path=%s
+`, hostnameList, pattern, scriptPath, pattern, scriptPath)
+}
+
+func dedupe(in []string) []string {
+	if len(in) <= 1 {
+		return in
+	}
+	out := in[:1]
+	for _, v := range in[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func login(ctx context.Context, client *http.Client, resourceURL *url.URL, callbackHost string, openBrowser bool, stdin io.Reader, logw io.Writer, verbose bool) (*loginResult, error) {
