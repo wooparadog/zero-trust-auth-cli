@@ -34,17 +34,8 @@ const appName = "zero-trust-auth-cli"
 
 var version = "dev"
 
-type config struct {
-	Resource            string `json:"resource,omitempty"`
-	TokenFile           string `json:"token_file,omitempty"`
-	AuthorizationServer string `json:"authorization_server,omitempty"`
-	UpdatedAt           string `json:"updated_at,omitempty"`
-}
-
 type appPaths struct {
 	ConfigDir    string
-	ConfigFile   string
-	TokenFile    string
 	TokensDir    string
 	GlobalLoader string
 }
@@ -152,14 +143,13 @@ func printUsage(w io.Writer) {
 
 Usage:
   %[1]s login [flags] <protected-url>
-  %[1]s renew [flags]
+  %[1]s renew <token-env-file>
   %[1]s config-path
   %[1]s version
 
 Login flags:
-  -resource URL          Protected Cloudflare Access URL. Overrides config.
-  -out FILE              Sourceable shell output file. Defaults to the config dir.
-  -config FILE           Config file path. Defaults to the config dir.
+  -resource URL          Protected Cloudflare Access URL.
+  -out FILE              Sourceable shell output file. Defaults to tokens/<host>.env.
   -surge-dir DIR         If set, also write cf-zero-trust.js and cf-zero-trust.sgmodule
                          into DIR (typically the folder Surge loads modules from).
                          Omit to skip Surge artifact generation.
@@ -169,8 +159,6 @@ Login flags:
   -verbose               Print raw token endpoint responses to stderr. Contains secrets.
 
 Renew flags:
-  -out FILE              Sourceable shell token file to renew. Defaults to config.
-  -config FILE           Config file path. Defaults to the config dir.
   -resource URL          Protected Cloudflare Access URL for endpoint discovery fallback.
   -timeout DURATION      Time to wait for token renewal. Defaults to 30s.
   -verbose               Print raw token endpoint responses to stderr. Contains secrets.
@@ -180,10 +168,8 @@ Example:
   %[1]s login https://other.internal.example.com
   # Add once to shell startup:
   . "$(%[1]s config-path)/tokens.env"
-  # Renew the last-used domain's token:
-  %[1]s renew
   # Renew a specific domain's token:
-  %[1]s renew -out "$(%[1]s config-path)/tokens/example.com.env"
+  %[1]s renew "$(%[1]s config-path)/tokens/example.com.env"
 
 Remote SSH:
   Open the printed authorization URL locally. If the browser cannot reach
@@ -211,7 +197,6 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	resourceFlag := fs.String("resource", "", "protected Cloudflare Access URL")
 	outFlag := fs.String("out", "", "sourceable shell output file")
-	configFlag := fs.String("config", paths.ConfigFile, "config file path")
 	surgeDirFlag := fs.String("surge-dir", "", "if set, also write cf-zero-trust.js and cf-zero-trust.sgmodule into this directory (e.g. /path/to/SurgeProfiles). Omit to skip Surge artifact generation.")
 	callbackHost := fs.String("callback-host", "127.0.0.1", "loopback callback host")
 	timeout := fs.Duration("timeout", 5*time.Minute, "time to wait for browser authorization")
@@ -224,21 +209,9 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return errors.New("login accepts at most one protected URL")
 	}
 
-	configPath, err := expandPath(*configFlag)
-	if err != nil {
-		return err
-	}
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		return err
-	}
-
 	resource := strings.TrimSpace(*resourceFlag)
 	if fs.NArg() == 1 {
 		resource = strings.TrimSpace(fs.Arg(0))
-	}
-	if resource == "" {
-		resource = strings.TrimSpace(cfg.Resource)
 	}
 	if resource == "" {
 		return errors.New("missing protected URL; pass one as an argument or with -resource")
@@ -267,7 +240,7 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	shellFile := renderShellEnv(result, time.Now().UTC(), outputPath, configPath)
+	shellFile := renderShellEnv(result, time.Now().UTC(), outputPath)
 	if err := writePrivateFile(outputPath, []byte(shellFile)); err != nil {
 		return err
 	}
@@ -282,14 +255,6 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	cfg.Resource = result.Resource
-	cfg.TokenFile = outputPath
-	cfg.AuthorizationServer = result.AuthorizationServer
-	cfg.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := saveConfig(configPath, cfg); err != nil {
-		return err
-	}
-
 	fmt.Fprintf(stdout, "Wrote token file: %s\n", outputPath)
 	fmt.Fprintf(stdout, "Global loader:   %s\n", paths.GlobalLoader)
 	fmt.Fprintf(stdout, "Add to shell startup: . %s\n", shellQuote(paths.GlobalLoader))
@@ -298,42 +263,65 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 }
 
 func runRenew(args []string, stdout, stderr io.Writer) error {
-	paths, err := defaultPaths()
-	if err != nil {
-		return err
-	}
-
 	fs := flag.NewFlagSet("renew", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	outFlag := fs.String("out", "", "sourceable shell token file to renew")
-	configFlag := fs.String("config", paths.ConfigFile, "config file path")
+	outFlag := fs.String("out", "", "token file path (used internally by the shell auto-renew snippet; prefer passing path as positional arg)")
 	resourceFlag := fs.String("resource", "", "protected Cloudflare Access URL for endpoint discovery fallback")
 	timeout := fs.Duration("timeout", 30*time.Second, "time to wait for token renewal")
 	verbose := fs.Bool("verbose", false, "print raw token endpoint responses to stderr")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 0 {
-		return errors.New("renew does not accept positional arguments")
+	if fs.NArg() > 1 {
+		return errors.New("renew accepts at most one positional argument")
 	}
 
-	configPath, err := expandPath(*configFlag)
-	if err != nil {
-		return err
-	}
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		return err
+	// External use: positional arg triggers the shell auto-renew with force-refresh.
+	// The shell snippet inside the env file handles the actual token renewal.
+	if fs.NArg() == 1 {
+		envPath, err := expandPath(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		cmd := exec.Command("sh", "-c", "unset CF_ACCESS_TOKEN_AUTO_RENEWING; export CF_ACCESS_FORCE_REFRESH=1; . "+shellQuote(envPath))
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("renew %s: %w", envPath, err)
+		}
+		return nil
 	}
 
+	// Internal use: invoked by the shell auto-renew snippet via -out.
 	tokenPath := strings.TrimSpace(*outFlag)
 	if tokenPath == "" {
-		tokenPath = strings.TrimSpace(cfg.TokenFile)
+		paths, err := defaultPaths()
+		if err != nil {
+			return errors.New("pass the token env file as a positional argument: renew <path-to-env>")
+		}
+		entries, readErr := os.ReadDir(paths.TokensDir)
+		var msg strings.Builder
+		msg.WriteString("pass the token env file as a positional argument: renew <path-to-env>\n\nAvailable token files:")
+		found := false
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".env") {
+				msg.WriteString("\n  ")
+				msg.WriteString(filepath.Join(paths.TokensDir, e.Name()))
+				found = true
+			}
+		}
+		if !found {
+			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+				msg.WriteString("\n  (could not read tokens directory: ")
+				msg.WriteString(readErr.Error())
+				msg.WriteString(")")
+			} else {
+				msg.WriteString("\n  (none — run login first)")
+			}
+		}
+		return errors.New(msg.String())
 	}
-	if tokenPath == "" {
-		tokenPath = paths.TokenFile
-	}
-	tokenPath, err = expandPath(tokenPath)
+	tokenPath, err := expandPath(tokenPath)
 	if err != nil {
 		return err
 	}
@@ -352,8 +340,8 @@ func runRenew(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("%s does not include CF_ACCESS_CLIENT_ID; run login again", tokenPath)
 	}
 
-	resource := firstNonEmpty(*resourceFlag, env["CF_ACCESS_RESOURCE"], cfg.Resource)
-	authServer := firstNonEmpty(env["CF_ACCESS_AUTHORIZATION_SERVER"], cfg.AuthorizationServer)
+	resource := firstNonEmpty(*resourceFlag, env["CF_ACCESS_RESOURCE"])
+	authServer := env["CF_ACCESS_AUTHORIZATION_SERVER"]
 	tokenEndpoint := strings.TrimSpace(env["CF_ACCESS_TOKEN_ENDPOINT"])
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -395,16 +383,8 @@ func runRenew(args []string, stdout, stderr io.Writer) error {
 		IssuedAt:            now,
 	}
 
-	shellFile := renderShellEnv(result, now, tokenPath, configPath)
+	shellFile := renderShellEnv(result, now, tokenPath)
 	if err := writePrivateFile(tokenPath, []byte(shellFile)); err != nil {
-		return err
-	}
-
-	cfg.Resource = firstNonEmpty(result.Resource, cfg.Resource)
-	cfg.TokenFile = tokenPath
-	cfg.AuthorizationServer = firstNonEmpty(result.AuthorizationServer, cfg.AuthorizationServer)
-	cfg.UpdatedAt = now.Format(time.RFC3339)
-	if err := saveConfig(configPath, cfg); err != nil {
 		return err
 	}
 
@@ -1287,7 +1267,7 @@ func parseBearerChallenge(header string) map[string]string {
 	return result
 }
 
-func renderShellEnv(result *loginResult, generatedAt time.Time, tokenFile, configFile string) string {
+func renderShellEnv(result *loginResult, generatedAt time.Time, tokenFile string) string {
 	expiresAt := ""
 	expiresAtUnix := ""
 	if result.Token.ExpiresIn > 0 {
@@ -1314,23 +1294,6 @@ func renderShellEnv(result *loginResult, generatedAt time.Time, tokenFile, confi
 		{"CF_ACCESS_AUTHORIZATION_SERVER", result.AuthorizationServer},
 		{"CF_ACCESS_TOKEN_ENDPOINT", result.TokenEndpoint},
 		{"CF_ACCESS_TOKEN_FILE", tokenFile},
-		{"CF_ACCESS_CONFIG_FILE", configFile},
-	}
-
-	writeExport := func(b *strings.Builder, name, value string) {
-		b.WriteString("export ")
-		b.WriteString(name)
-		b.WriteByte('=')
-		b.WriteString(shellQuote(value))
-		b.WriteByte('\n')
-		if domainSuffix != "" {
-			b.WriteString("export ")
-			b.WriteString(name)
-			b.WriteString(domainSuffix)
-			b.WriteByte('=')
-			b.WriteString(shellQuote(value))
-			b.WriteByte('\n')
-		}
 	}
 
 	var b strings.Builder
@@ -1342,11 +1305,38 @@ func renderShellEnv(result *loginResult, generatedAt time.Time, tokenFile, confi
 		if item[1] == "" {
 			continue
 		}
-		writeExport(&b, item[0], item[1])
+		b.WriteString("export ")
+		b.WriteString(item[0])
+		b.WriteByte('=')
+		b.WriteString(shellQuote(item[1]))
+		b.WriteByte('\n')
 	}
 	if result.Token.AccessToken != "" {
-		writeExport(&b, "CF_ACCESS_BEARER", "Bearer "+result.Token.AccessToken)
-		writeExport(&b, "CF_ACCESS_AUTHORIZATION_HEADER", "Authorization: Bearer "+result.Token.AccessToken)
+		bearer := "Bearer " + result.Token.AccessToken
+		authHeader := "Authorization: Bearer " + result.Token.AccessToken
+		b.WriteString("export CF_ACCESS_BEARER=")
+		b.WriteString(shellQuote(bearer))
+		b.WriteByte('\n')
+		b.WriteString("export CF_ACCESS_AUTHORIZATION_HEADER=")
+		b.WriteString(shellQuote(authHeader))
+		b.WriteByte('\n')
+		if domainSuffix != "" {
+			b.WriteString("export CF_SITE_ACCESS_TOKEN")
+			b.WriteString(domainSuffix)
+			b.WriteByte('=')
+			b.WriteString(shellQuote(result.Token.AccessToken))
+			b.WriteByte('\n')
+			b.WriteString("export CF_SITE_ACCESS_BEARER")
+			b.WriteString(domainSuffix)
+			b.WriteByte('=')
+			b.WriteString(shellQuote(bearer))
+			b.WriteByte('\n')
+			b.WriteString("export CF_SITE_ACCESS_AUTHORIZATION_HEADER")
+			b.WriteString(domainSuffix)
+			b.WriteByte('=')
+			b.WriteString(shellQuote(authHeader))
+			b.WriteByte('\n')
+		}
 	}
 	writeAutoRenewShell(&b)
 	return b.String()
@@ -1359,10 +1349,14 @@ cf_access_token_expired() {
   [ -n "${CF_ACCESS_TOKEN_EXPIRES_AT_UNIX:-}" ] && [ "$(date +%s)" -ge "${CF_ACCESS_TOKEN_EXPIRES_AT_UNIX:-0}" ]
 }
 
-if [ -z "${CF_ACCESS_TOKEN_AUTO_RENEWING:-}" ] && cf_access_token_expired; then
+cf_access_token_needs_refresh() {
+  [ -n "${CF_ACCESS_FORCE_REFRESH:-}" ] || cf_access_token_expired
+}
+
+if [ -z "${CF_ACCESS_TOKEN_AUTO_RENEWING:-}" ] && cf_access_token_needs_refresh; then
   if command -v zero-trust-auth-cli >/dev/null 2>&1; then
     CF_ACCESS_TOKEN_AUTO_RENEWING=1
-    if zero-trust-auth-cli renew -config "$CF_ACCESS_CONFIG_FILE" -out "$CF_ACCESS_TOKEN_FILE" >/dev/null; then
+    if zero-trust-auth-cli renew -out "$CF_ACCESS_TOKEN_FILE" >/dev/null; then
       if [ -f "$CF_ACCESS_TOKEN_FILE" ]; then
         . "$CF_ACCESS_TOKEN_FILE"
       fi
@@ -1374,8 +1368,12 @@ if [ -z "${CF_ACCESS_TOKEN_AUTO_RENEWING:-}" ] && cf_access_token_expired; then
       else
         printf '%s\n' 'Suggested command: zero-trust-auth-cli login <protected-url>' >&2
       fi
+      unset CF_ACCESS_TOKEN_AUTO_RENEWING
+      unset CF_ACCESS_FORCE_REFRESH
+      return 1 2>/dev/null || exit 1
     fi
     unset CF_ACCESS_TOKEN_AUTO_RENEWING
+    unset CF_ACCESS_FORCE_REFRESH
   else
     printf '%s\n' 'Cloudflare Access token is expired, but zero-trust-auth-cli was not found in PATH.' >&2
     printf '%s\n' 'Install zero-trust-auth-cli or run zero-trust-auth-cli renew manually.' >&2
@@ -1496,32 +1494,6 @@ func isShellIdentifier(value string) bool {
 	return true
 }
 
-func loadConfig(path string) (*config, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return &config{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var cfg config
-	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("read config %s: %w", path, err)
-	}
-	return &cfg, nil
-}
-
-func saveConfig(path string, cfg *config) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return writePrivateFile(path, data)
-}
-
 func writePrivateFile(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -1609,8 +1581,6 @@ func defaultPaths() (appPaths, error) {
 	configDir = filepath.Join(configDir, appName)
 	return appPaths{
 		ConfigDir:    configDir,
-		ConfigFile:   filepath.Join(configDir, "config.json"),
-		TokenFile:    filepath.Join(configDir, "token.env"),
 		TokensDir:    filepath.Join(configDir, "tokens"),
 		GlobalLoader: filepath.Join(configDir, "tokens.env"),
 	}, nil
