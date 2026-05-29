@@ -71,17 +71,16 @@ func TestRenderShellEnv(t *testing.T) {
 		IssuedAt:            issuedAt,
 	}
 
-	env := renderShellEnv(result, issuedAt, "/tmp/token.env", "/tmp/config.json")
+	env := renderShellEnv(result, issuedAt, "/tmp/token.env")
 	for _, want := range []string{
 		"export CF_ACCESS_TOKEN='oauth:access'",
 		"export CF_ACCESS_REFRESH_TOKEN='oauth:refresh'",
 		"export CF_ACCESS_TOKEN_EXPIRES_AT='2026-04-25T01:17:03Z'",
 		"export CF_ACCESS_TOKEN_EXPIRES_AT_UNIX='1777079823'",
 		"export CF_ACCESS_TOKEN_FILE='/tmp/token.env'",
-		"export CF_ACCESS_CONFIG_FILE='/tmp/config.json'",
 		"export CF_ACCESS_BEARER='Bearer oauth:access'",
 		"export CF_ACCESS_AUTHORIZATION_HEADER='Authorization: Bearer oauth:access'",
-		"zero-trust-auth-cli renew -config \"$CF_ACCESS_CONFIG_FILE\" -out \"$CF_ACCESS_TOKEN_FILE\"",
+		"zero-trust-auth-cli renew -out \"$CF_ACCESS_TOKEN_FILE\"",
 		"Suggested command: zero-trust-auth-cli login",
 	} {
 		if !strings.Contains(env, want) {
@@ -97,7 +96,6 @@ func TestGeneratedShellEnvAutoRenewsExpiredToken(t *testing.T) {
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, "token.env")
-	configPath := filepath.Join(dir, "config.json")
 	binDir := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -144,7 +142,7 @@ EOF
 		TokenEndpoint:       "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/token",
 		IssuedAt:            time.Unix(1, 0).UTC(),
 	}
-	if err := os.WriteFile(tokenPath, []byte(renderShellEnv(expired, time.Now().UTC(), tokenPath, configPath)), 0o600); err != nil {
+	if err := os.WriteFile(tokenPath, []byte(renderShellEnv(expired, time.Now().UTC(), tokenPath)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -163,7 +161,6 @@ func TestGeneratedShellEnvPromptsLoginWhenRenewFails(t *testing.T) {
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, "token.env")
-	configPath := filepath.Join(dir, "config.json")
 	binDir := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -188,15 +185,15 @@ func TestGeneratedShellEnvPromptsLoginWhenRenewFails(t *testing.T) {
 		TokenEndpoint:       "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/token",
 		IssuedAt:            time.Unix(1, 0).UTC(),
 	}
-	if err := os.WriteFile(tokenPath, []byte(renderShellEnv(expired, time.Now().UTC(), tokenPath, configPath)), 0o600); err != nil {
+	if err := os.WriteFile(tokenPath, []byte(renderShellEnv(expired, time.Now().UTC(), tokenPath)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	cmd := exec.Command("sh", "-c", `. "$1"`, "sh", tokenPath)
 	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("source expired env with failed renew should not fail shell: %v\n%s", err, output)
+	if err == nil {
+		t.Fatalf("source expired env with failed renew should exit non-zero\n%s", output)
 	}
 	text := string(output)
 	if !strings.Contains(text, "The refresh token may be expired") {
@@ -293,7 +290,6 @@ func TestRunRenewRewritesTokenFile(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.json")
 	tokenPath := filepath.Join(dir, "token.env")
 	initial := renderShellEnv(&loginResult{
 		Token: tokenResponse{
@@ -308,20 +304,13 @@ func TestRunRenewRewritesTokenFile(t *testing.T) {
 		AuthorizationServer: server.URL,
 		TokenEndpoint:       server.URL,
 		IssuedAt:            time.Now().UTC(),
-	}, time.Now().UTC(), tokenPath, configPath)
+	}, time.Now().UTC(), tokenPath)
 	if err := os.WriteFile(tokenPath, []byte(initial), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := saveConfig(configPath, &config{
-		Resource:            "https://example.com",
-		TokenFile:           tokenPath,
-		AuthorizationServer: server.URL,
-	}); err != nil {
 		t.Fatal(err)
 	}
 
 	var stdout, stderr strings.Builder
-	if err := runRenew([]string{"-config", configPath}, &stdout, &stderr); err != nil {
+	if err := runRenew([]string{"-out", tokenPath}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 
