@@ -3,11 +3,11 @@
 Surge integration is **opt-in**: pass `-surge-dir DIR` to `login` and the
 CLI writes two artifacts into `DIR` (typically the folder Surge loads
 modules from, e.g. `/path/to/SurgeProfiles`). Omit the flag and the CLI just
-writes `token.env` like before.
+writes the normal per-host token file and global loader.
 
 ```
 <surge-dir>/
-├── cf-zero-trust.js               # http-request script — BOOTSTRAP map is INLINED
+├── cf-zero-trust.js               # http-request/http-response script — BOOTSTRAP map is INLINED
 └── cf-zero-trust.sgmodule         # Surge module: [MITM] + [Script] with absolute script-path
 ```
 
@@ -56,8 +56,9 @@ no `Bearer ` prefix), matching what Cloudflare Access expects.
    Output:
 
    ```
-   Wrote sourceable token file: …/token.env
-   Load it with: . '…/token.env'
+   Wrote token file: …/tokens/your-protected.example.com.env
+   Global loader:   …/tokens.env
+   Add to shell startup: . '…/tokens.env'
 
    ────────────────────────────── Surge ──────────────────────────────
      script:    /path/to/SurgeProfiles/cf-zero-trust.js
@@ -81,8 +82,8 @@ no `Bearer ` prefix), matching what Cloudflare Access expects.
    it cannot modify request headers in HTTPS traffic.
 
 That's the whole setup. Re-running `login` (e.g., to add another origin or
-after a `refresh_token` revocation) rewrites all three artifacts; Surge picks
-them up on the next profile reload.
+after a `refresh_token` revocation) rewrites the token file, global loader, and
+Surge artifacts; Surge picks them up on the next profile reload.
 
 ## What persists where
 
