@@ -81,6 +81,7 @@ func TestRenderShellEnv(t *testing.T) {
 		"export CF_ACCESS_BEARER='Bearer oauth:access'",
 		"export CF_ACCESS_AUTHORIZATION_HEADER='Authorization: Bearer oauth:access'",
 		"zero-trust-auth-cli renew -out \"$CF_ACCESS_TOKEN_FILE\"",
+		"Cloudflare Zero Trust Access token for ${_cf_access_renew_target}",
 		"Suggested command: zero-trust-auth-cli login",
 	} {
 		if !strings.Contains(env, want) {
@@ -196,7 +197,10 @@ func TestGeneratedShellEnvPromptsLoginWhenRenewFails(t *testing.T) {
 		t.Fatalf("source expired env with failed renew should exit non-zero\n%s", output)
 	}
 	text := string(output)
-	if !strings.Contains(text, "The refresh token may be expired") {
+	if !strings.Contains(text, "zero-trust-auth-cli could not renew the Cloudflare Zero Trust Access token for https://example.com.") {
+		t.Fatalf("missing site-specific renewal failure prompt:\n%s", text)
+	}
+	if !strings.Contains(text, "The Cloudflare Zero Trust Access refresh token for https://example.com may be expired") {
 		t.Fatalf("missing refresh-expired prompt:\n%s", text)
 	}
 	if !strings.Contains(text, "Suggested command: zero-trust-auth-cli login https://example.com") {
@@ -312,6 +316,12 @@ func TestRunRenewRewritesTokenFile(t *testing.T) {
 	var stdout, stderr strings.Builder
 	if err := runRenew([]string{"-out", tokenPath}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "Renewing Cloudflare Zero Trust Access token for https://example.com with saved refresh token") {
+		t.Fatalf("stderr missing renewal target:\n%s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Renewed Cloudflare Zero Trust Access token for https://example.com") {
+		t.Fatalf("stdout missing renewal target:\n%s", stdout.String())
 	}
 
 	env, err := loadShellEnvFile(tokenPath)
