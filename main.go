@@ -355,7 +355,8 @@ func runRenew(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
-	fmt.Fprintln(stderr, "Renewing access token with saved refresh token")
+	renewTarget := describeRenewTarget(resource, tokenPath)
+	fmt.Fprintf(stderr, "Renewing Cloudflare Zero Trust Access token for %s with saved refresh token\n", renewTarget)
 	token, err := renewAccessToken(ctx, httpClient, tokenEndpoint, clientID, refreshToken, verboseWriter(stderr, *verbose))
 	if err != nil {
 		return err
@@ -388,9 +389,17 @@ func runRenew(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	fmt.Fprintf(stdout, "Renewed sourceable token file: %s\n", tokenPath)
+	fmt.Fprintf(stdout, "Renewed Cloudflare Zero Trust Access token for %s\n", renewTarget)
+	fmt.Fprintf(stdout, "Updated sourceable token file: %s\n", tokenPath)
 	fmt.Fprintf(stdout, "Reload it with: . %s\n", shellQuote(tokenPath))
 	return nil
+}
+
+func describeRenewTarget(resource, tokenPath string) string {
+	if strings.TrimSpace(resource) != "" {
+		return strings.TrimSpace(resource)
+	}
+	return "token file " + tokenPath
 }
 
 // writeSurgeArtifacts merges the result into the BOOTSTRAP map inlined in
@@ -1354,6 +1363,7 @@ cf_access_token_needs_refresh() {
 }
 
 if [ -z "${CF_ACCESS_TOKEN_AUTO_RENEWING:-}" ] && cf_access_token_needs_refresh; then
+  _cf_access_renew_target="${CF_ACCESS_RESOURCE:-$CF_ACCESS_TOKEN_FILE}"
   if command -v zero-trust-auth-cli >/dev/null 2>&1; then
     CF_ACCESS_TOKEN_AUTO_RENEWING=1
     if zero-trust-auth-cli renew -out "$CF_ACCESS_TOKEN_FILE" >/dev/null; then
@@ -1361,8 +1371,8 @@ if [ -z "${CF_ACCESS_TOKEN_AUTO_RENEWING:-}" ] && cf_access_token_needs_refresh;
         . "$CF_ACCESS_TOKEN_FILE"
       fi
     else
-      printf '%s\n' 'zero-trust-auth-cli could not renew the Cloudflare Access token.' >&2
-      printf '%s\n' 'The refresh token may be expired. Please run login again; no login command was executed automatically.' >&2
+      printf '%s\n' "zero-trust-auth-cli could not renew the Cloudflare Zero Trust Access token for ${_cf_access_renew_target}." >&2
+      printf '%s\n' "The Cloudflare Zero Trust Access refresh token for ${_cf_access_renew_target} may be expired. Please run login again; no login command was executed automatically." >&2
       if [ -n "${CF_ACCESS_RESOURCE:-}" ]; then
         printf '%s\n' "Suggested command: zero-trust-auth-cli login ${CF_ACCESS_RESOURCE}" >&2
       else
@@ -1375,9 +1385,10 @@ if [ -z "${CF_ACCESS_TOKEN_AUTO_RENEWING:-}" ] && cf_access_token_needs_refresh;
     unset CF_ACCESS_TOKEN_AUTO_RENEWING
     unset CF_ACCESS_FORCE_REFRESH
   else
-    printf '%s\n' 'Cloudflare Access token is expired, but zero-trust-auth-cli was not found in PATH.' >&2
+    printf '%s\n' "Cloudflare Zero Trust Access token for ${_cf_access_renew_target} is expired, but zero-trust-auth-cli was not found in PATH." >&2
     printf '%s\n' 'Install zero-trust-auth-cli or run zero-trust-auth-cli renew manually.' >&2
   fi
+  unset _cf_access_renew_target
 fi
 `)
 }
